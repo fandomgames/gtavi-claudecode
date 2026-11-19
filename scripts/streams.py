@@ -61,8 +61,8 @@ def twitch_nokey(game="Grand Theft Auto VI", limit=20):
     try:
         rows = tw.top_streams(game, limit)
     except Exception as e:
-        print(f"twitch (no key) failed: {e}", file=sys.stderr)
-        return []
+        print(f"WARNING: Twitch lookup failed, Twitch results are missing (not zero). {e}", file=sys.stderr)
+        return None
     now = time.time()
     return [{"platform": "Twitch", "channel": r["login"], "title": r["title"], "url": r["url"], "viewers": r["viewers"],
              "live_for": fmt_dur(now - tw.started_ts(r["created_at"])) if tw.started_ts(r["created_at"]) else ""} for r in rows]
@@ -75,14 +75,18 @@ def twitch(query):
     import requests
     h = {"Client-Id": cid, "Authorization": f"Bearer {tok}"}
     try:
-        g = requests.get("https://api.twitch.tv/helix/games", params={"name": "Grand Theft Auto VI"}, headers=h, timeout=15).json()
+        gr = requests.get("https://api.twitch.tv/helix/games", params={"name": "Grand Theft Auto VI"}, headers=h, timeout=15)
+        gr.raise_for_status()
+        g = gr.json()
         if not g.get("data"):
             return []
         gid = g["data"][0]["id"]
-        s = requests.get("https://api.twitch.tv/helix/streams", params={"game_id": gid, "first": 100}, headers=h, timeout=15).json()
+        sr = requests.get("https://api.twitch.tv/helix/streams", params={"game_id": gid, "first": 100}, headers=h, timeout=15)
+        sr.raise_for_status()
+        s = sr.json()
     except Exception as e:
-        print(f"twitch failed: {e}", file=sys.stderr)
-        return []
+        print(f"WARNING: Twitch lookup failed, Twitch results are missing (not zero). {e}", file=sys.stderr)
+        return None
     now = time.time(); out = []
     for x in s.get("data", []):
         try:
@@ -122,8 +126,7 @@ def main():
     t = twitch(a.query)
     if t:
         t = sorted(t, key=lambda r: r["viewers"] or -1, reverse=True)[:a.limit]
-    if t is not None:
-        sections.append(("Twitch", t))
+    sections.append(("Twitch", t))  # None = lookup failed, shown as such in the report
     k = kick(a.query)
     if k:
         sections.append(("Kick", k))
@@ -132,7 +135,7 @@ def main():
     for name, rows in sections:
         md += [f"## {name}", ""]
         if rows is None:
-            md += ["Lookup failed, see the warning in the terminal. This is not a count of zero.", ""]
+            md += ["Lookup failed — this is not a count of zero. See the warning in the terminal.", ""]
             continue
         rows = sorted(rows, key=lambda r: r["viewers"] or -1, reverse=True)
         if not rows:
