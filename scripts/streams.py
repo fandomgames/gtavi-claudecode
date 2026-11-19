@@ -5,11 +5,10 @@ YouTube always. Twitch always (Helix if TWITCH_CLIENT_ID and TWITCH_TOKEN are se
 Viewer counts are exactly what the platform returned at run time.
 """
 import argparse, json, os, sys, time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote_plus
 sys.path.insert(0, str(Path(__file__).parent))
-from common import ytdlp_base, ytdlp_json, run
+from common import ytdlp_base, run
 
 try:
     import truststore
@@ -26,32 +25,33 @@ def fmt_dur(sec):
 
 
 def youtube(query, limit):
+    """One flat search request. The search results already carry channel, title, live status,
+    concurrent viewers and start time, so no per-video lookups (those hit YouTube's bot check
+    from cloud and datacenter IPs)."""
     url = f"https://www.youtube.com/results?search_query={quote_plus(query)}&sp=EgJAAQ%253D%253D"
     r = run(ytdlp_base() + ["--flat-playlist", "-J", "--playlist-end", str(limit), url], capture=True, check=False)
     if r.returncode != 0 or not r.stdout.strip():
-        print(f"youtube search failed: {(r.stderr or '')[-300:]}", file=sys.stderr)
-        return []
-    ids = []
-    for e in json.loads(r.stdout).get("entries") or []:
-        if e and e.get("id"):
-            ids.append(e.get("url") or f"https://www.youtube.com/watch?v={e['id']}")
-
-    def one(u):
-        try:
-            return ytdlp_json(u)
-        except BaseException:  # run() calls sys.exit on failure
-            return None
-
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        infos = list(ex.map(one, ids))
+        err = (r.stderr or "").strip().splitlines()
+        print(f"WARNING: YouTube search failed, YouTube results are missing (not zero). "
+              f"{err[-1][-300:] if err else 'no output from yt-dlp'}", file=sys.stderr)
+        return None
+    try:
+        entries = [e for e in (json.loads(r.stdout).get("entries") or []) if e and e.get("id")]
+    except ValueError as e:
+        print(f"WARNING: YouTube search returned unreadable data, YouTube results are missing: {e}", file=sys.stderr)
+        return None
     now = time.time(); out = []
-    for i in infos:
-        if not i or not i.get("is_live"):
+    for e in entries:
+        if e.get("live_status") not in (None, "is_live"):
             continue
-        start = i.get("release_timestamp") or i.get("timestamp")
-        out.append({"platform": "YouTube", "channel": i.get("channel") or i.get("uploader") or "",
-                    "title": i.get("title") or "", "url": i.get("webpage_url") or "",
-                    "viewers": i.get("concurrent_view_count"), "live_for": fmt_dur(now - start) if start else ""})
+        start = e.get("release_timestamp") or e.get("timestamp")
+        out.append({"platform": "YouTube", "channel": e.get("channel") or e.get("uploader") or "",
+                    "title": e.get("title") or "",
+                    "url": e.get("url") or f"https://www.youtube.com/watch?v={e['id']}",
+                    "viewers": e.get("concurrent_view_count"), "live_for": fmt_dur(now - start) if start else ""})
+    if entries and all(x["viewers"] is None for x in out):
+        print("WARNING: YouTube search returned streams but no viewer counts; the search page format may have "
+              "changed. Update yt-dlp (pip install -U yt-dlp).", file=sys.stderr)
     return out
 
 
@@ -61,8 +61,8 @@ def twitch_nokey(game="Grand Theft Auto VI", limit=20):
     try:
         rows = tw.top_streams(game, limit)
     except Exception as e:
-        print(f"twitch (no key) failed: {e}", file=sys.stderr)
-        return []
+        print(f"WARNING: Twitch lookup failed, Twitch results are missing (not zero). {e}", file=sys.stderr)
+        return None
     now = time.time()
     return [{"platform": "Twitch", "channel": r["login"], "title": r["title"], "url": r["url"], "viewers": r["viewers"],
              "live_for": fmt_dur(now - tw.started_ts(r["created_at"])) if tw.started_ts(r["created_at"]) else ""} for r in rows]
@@ -75,14 +75,18 @@ def twitch(query):
     import requests
     h = {"Client-Id": cid, "Authorization": f"Bearer {tok}"}
     try:
-        g = requests.get("https://api.twitch.tv/helix/games", params={"name": "Grand Theft Auto VI"}, headers=h, timeout=15).json()
+        gr = requests.get("https://api.twitch.tv/helix/games", params={"name": "Grand Theft Auto VI"}, headers=h, timeout=15)
+        gr.raise_for_status()
+        g = gr.json()
         if not g.get("data"):
             return []
         gid = g["data"][0]["id"]
-        s = requests.get("https://api.twitch.tv/helix/streams", params={"game_id": gid, "first": 100}, headers=h, timeout=15).json()
+        sr = requests.get("https://api.twitch.tv/helix/streams", params={"game_id": gid, "first": 100}, headers=h, timeout=15)
+        sr.raise_for_status()
+        s = sr.json()
     except Exception as e:
-        print(f"twitch failed: {e}", file=sys.stderr)
-        return []
+        print(f"WARNING: Twitch lookup failed, Twitch results are missing (not zero). {e}", file=sys.stderr)
+        return None
     now = time.time(); out = []
     for x in s.get("data", []):
         try:
@@ -117,20 +121,23 @@ def main():
     ap.add_argument("--query", default="gta 6"); ap.add_argument("--limit", type=int, default=20)
     ap.add_argument("--out", default="streams.md")
     a = ap.parse_args()
-    sections = [("YouTube", youtube(a.query, a.limit))]
+    y = youtube(a.query, a.limit)
+    sections = [("YouTube", y)]
     t = twitch(a.query)
     if t:
         t = sorted(t, key=lambda r: r["viewers"] or -1, reverse=True)[:a.limit]
-    if t is not None:
-        sections.append(("Twitch", t))
+    sections.append(("Twitch", t))  # None = lookup failed, shown as such in the report
     k = kick(a.query)
     if k:
         sections.append(("Kick", k))
     stamp = time.strftime("%Y-%m-%d %H:%M")
     md = [f"# Live streams: {a.query}", f"Checked {stamp}. Viewer counts are as returned at that moment.", ""]
     for name, rows in sections:
-        rows = sorted(rows, key=lambda r: r["viewers"] or -1, reverse=True)
         md += [f"## {name}", ""]
+        if rows is None:
+            md += ["Lookup failed — this is not a count of zero. See the warning in the terminal.", ""]
+            continue
+        rows = sorted(rows, key=lambda r: r["viewers"] or -1, reverse=True)
         if not rows:
             md += ["No live streams found.", ""]
             continue

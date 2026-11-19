@@ -44,7 +44,8 @@ def _rows(game):
 
 
 def top_streams(game="Grand Theft Auto VI", limit=20):
-    """Live streams of a Twitch category, sorted by viewers (desc). Empty list if the category is unknown/offline."""
+    """Live streams of a Twitch category, sorted by viewers (desc). Empty list if the category is unknown/offline.
+    Raises RuntimeError if every lookup failed, so callers never mistake a network/API failure for zero streams."""
     names = [game]
     try:
         d = gql(_Q_SEARCH, {"q": game})
@@ -56,16 +57,21 @@ def top_streams(game="Grand Theft Auto VI", limit=20):
         print(f"twitch category search failed: {ex}", file=sys.stderr)
     if game.lower() != "gta vi":
         names.append("Grand Theft Auto VI" if "grand theft" not in game.lower() else "GTA VI")
+    ok, last_err = False, None
     for nm in names:
         try:
             g = ((gql(_Q_GAME, {"name": nm, "n": int(limit)}).get("data") or {}).get("game"))
+            ok = True
         except Exception as ex:
             print(f"twitch gql failed: {ex}", file=sys.stderr)
+            last_err = ex
             continue
         if g:
             rows = _rows(g)
             if rows:
                 return sorted(rows, key=lambda r: r["viewers"], reverse=True)
+    if not ok:
+        raise RuntimeError(f"every Twitch lookup failed ({last_err})")
     return []
 
 
